@@ -34,18 +34,34 @@ STT_URL = "https://api.vachana.ai/stt/v3"
 TTS_URL = "https://api.vachana.ai/api/v1/tts/inference"
 
 # Timeouts are in milliseconds for the Gemini SDK and seconds for requests.
-GEMINI_TIMEOUT_MS = 45000
-GNANI_TTS_TIMEOUT_SECONDS = 45
-GNANI_STT_TIMEOUT_SECONDS = 120  # Keep the known-working STT timeout.
+# Per-stage budgets add up to 115 seconds, leaving 5 seconds of overhead
+# inside the 120-second end-to-end processing budget.
+TOTAL_PIPELINE_TIMEOUT_SECONDS = 120
+GNANI_STT_TIMEOUT_SECONDS = 45
+GEMINI_TIMEOUT_SECONDS = 30
+GNANI_TTS_TIMEOUT_SECONDS = 40
+
+
+class PipelineTimeoutError(TimeoutError):
+    """Raised when a stage or the overall voice pipeline exceeds its budget."""
+
+
+def remaining_time(deadline, stage_limit):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PipelineTimeoutError(
+            "The 2-minute processing limit was reached. Please try a shorter recording."
+        )
+    return min(stage_limit, remaining)
 
 
 # ---------- Cached Gemini client ----------
 
 @st.cache_resource
-def get_gemini_client(api_key):
+def get_gemini_client(api_key, timeout_ms):
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)
+        http_options=types.HttpOptions(timeout=timeout_ms)
     )
 
 
@@ -76,7 +92,8 @@ def choose_tts_language(text, detected):
 
 # ---------- Prisma speech recognition ----------
 
-def transcribe_audio(audio_bytes, filename):
+def transcribe_audio(audio_bytes, filename, deadline):
+    stage_timeout = remaining_time(deadline, GNANI_STT_TIMEOUT_SECONDS)
     response = requests.post(
         STT_URL,
         headers={"X-API-Key-ID": GNANI_API_KEY},
@@ -91,7 +108,7 @@ def transcribe_audio(audio_bytes, filename):
             "model": "prisma-v3.0",
             "language_code": "indic-auto"
         },
-        timeout=GNANI_STT_TIMEOUT_SECONDS
+        timeout=(min(10, stage_timeout), stage_timeout)
     )
     response.raise_for_status()
     result = response.json()
@@ -104,8 +121,11 @@ def transcribe_audio(audio_bytes, filename):
 
 # ---------- Gemini intelligence ----------
 
-def generate_answer(user_text):
-    client = get_gemini_client(GEMINI_API_KEY)
+def generate_answer(user_text, deadline):
+    stage_timeout = remaining_time(deadline, GEMINI_TIMEOUT_SECONDS)
+    client = get_gemini_client(
+        GEMINI_API_KEY, max(1000, int(stage_timeout * 1000))
+    )
 
     # Keep the instruction compact and the spoken answer concise.
     prompt = (
@@ -138,7 +158,8 @@ def generate_answer(user_text):
 
 # ---------- Timbre speech generation ----------
 
-def generate_speech(text, language):
+def generate_speech(text, language, deadline):
+    stage_timeout = remaining_time(deadline, GNANI_TTS_TIMEOUT_SECONDS)
     payload = {
         "text": text,
         "model": "timbre-v3.0",
@@ -161,7 +182,7 @@ def generate_speech(text, language):
             "Content-Type": "application/json"
         },
         json=payload,
-        timeout=GNANI_TTS_TIMEOUT_SECONDS
+        timeout=(min(10, stage_timeout), stage_timeout)
     )
 
     response.raise_for_status()
@@ -215,6 +236,8 @@ if st.button("Process my voice", type="primary", use_container_width=True):
         st.warning("Please record or upload audio first.")
     else:
         timings = {}
+        pipeline_start = time.monotonic()
+        deadline = pipeline_start + TOTAL_PIPELINE_TIMEOUT_SECONDS
 
         try:
             # Stage 1: Speech recognition
@@ -223,7 +246,8 @@ if st.button("Process my voice", type="primary", use_container_width=True):
                 audio_bytes = audio_file.getvalue()
                 transcript, detected = transcribe_audio(
                     audio_bytes,
-                    audio_file.name or "recording.wav"
+                    audio_file.name or "recording.wav",
+                    deadline
                 )
                 timings["Speech recognition"] = time.perf_counter() - stt_start
                 stt_status.update(
@@ -243,7 +267,7 @@ if st.button("Process my voice", type="primary", use_container_width=True):
             gemini_start = time.perf_counter()
             with st.status("2/3 — Gemini is preparing your answer...", expanded=True) as gemini_status:
                 try:
-                    answer = generate_answer(transcript)
+                    answer = generate_answer(transcript, deadline)
                     timings["AI response"] = time.perf_counter() - gemini_start
                     gemini_status.update(
                         label="2/3 — AI response ready",
@@ -265,7 +289,7 @@ if st.button("Process my voice", type="primary", use_container_width=True):
 
             with st.status("3/3 — Generating your voice response...", expanded=True) as tts_status:
                 try:
-                    audio_output = generate_speech(answer, tts_language)
+                    audio_output = generate_speech(answer, tts_language, deadline)
                     timings["Voice generation"] = time.perf_counter() - tts_start
                     tts_status.update(
                         label="3/3 — Voice response ready",
@@ -289,7 +313,7 @@ if st.button("Process my voice", type="primary", use_container_width=True):
             st.success("Conversation completed successfully!")
 
             st.subheader("Performance")
-            total_time = sum(timings.values())
+            total_time = time.monotonic() - pipeline_start
             metric_cols = st.columns(3)
             metric_cols[0].metric(
                 "Speech recognition",
@@ -305,10 +329,12 @@ if st.button("Process my voice", type="primary", use_container_width=True):
             )
             st.caption(f"Total processing time: {total_time:.1f} seconds")
 
-        except requests.exceptions.Timeout:
+        except (requests.exceptions.Timeout, PipelineTimeoutError, TimeoutError):
+            elapsed = time.monotonic() - pipeline_start
             st.error(
-                "A Gnani service took too long to respond. "
-                "Please try once more with a shorter audio clip."
+                f"Processing timed out after {elapsed:.1f} seconds. "
+                "The maximum processing window is 120 seconds. "
+                "Please try a shorter recording and retry."
             )
 
         except requests.exceptions.HTTPError as error:
@@ -347,4 +373,4 @@ if st.session_state.history:
         st.rerun()
 
 st.divider()
-st.caption("Bharat Voice AI | Powered by Gnani Prisma, Gemini and Timbre")
+st.caption("Bharat Voice AI | Powered by Gnani Prisma, Gemini and Timbre | 120-second processing limit")
