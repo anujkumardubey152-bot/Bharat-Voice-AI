@@ -1,10 +1,12 @@
-
 import os
 import re
 import time
+
 import streamlit as st
 import requests
 from google import genai
+from google.genai import types
+
 
 st.set_page_config(
     page_title="Bharat Voice AI",
@@ -23,12 +25,29 @@ def get_secret(name):
         pass
     return os.getenv(name)
 
+
 GNANI_API_KEY = get_secret("GNANI_API_KEY")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 
 GEMINI_MODEL = "gemini-3.8-flash"
 STT_URL = "https://api.vachana.ai/stt/v3"
 TTS_URL = "https://api.vachana.ai/api/v1/tts/inference"
+
+# Timeouts are in milliseconds for the Gemini SDK and seconds for requests.
+GEMINI_TIMEOUT_MS = 45000
+GNANI_TTS_TIMEOUT_SECONDS = 45
+GNANI_STT_TIMEOUT_SECONDS = 120  # Keep the known-working STT timeout.
+
+
+# ---------- Cached Gemini client ----------
+
+@st.cache_resource
+def get_gemini_client(api_key):
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)
+    )
+
 
 # ---------- Language routing ----------
 
@@ -49,7 +68,6 @@ def choose_tts_language(text, detected):
 
     if detected in supported:
         return detected
-
     if has_devanagari:
         return "hi-IN"
 
@@ -73,45 +91,49 @@ def transcribe_audio(audio_bytes, filename):
             "model": "prisma-v3.0",
             "language_code": "indic-auto"
         },
-        timeout=120
+        timeout=GNANI_STT_TIMEOUT_SECONDS
     )
-
     response.raise_for_status()
     result = response.json()
 
-    return (
-        result.get("transcript", ""),
-        result.get("detected_language_code", "unknown")
-    )
+    transcript = result.get("transcript", "")
+    detected = result.get("detected_language_code", "unknown")
+
+    return transcript, detected
 
 
 # ---------- Gemini intelligence ----------
 
 def generate_answer(user_text):
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = get_gemini_client(GEMINI_API_KEY)
 
-    prompt = f"""
-You are Bharat Voice AI, a helpful multilingual Indian voice assistant.
-
-Understand the user's intent and answer accurately.
-Respond in the same language and style as the user.
-Preserve Hindi, English and Hinglish naturally.
-Keep the answer concise and suitable for spoken delivery.
-Do not invent facts.
-
-User message:
-{user_text}
-"""
+    # Keep the instruction compact and the spoken answer concise.
+    prompt = (
+        "You are Bharat Voice AI, a helpful multilingual Indian voice assistant. "
+        "Understand the user's intent and answer accurately. "
+        "Reply in the same language and style as the user, preserving Hindi, "
+        "English, and Hinglish naturally. Keep the answer concise for spoken "
+        "delivery (normally 2-4 sentences). Do not invent facts. "
+        "If unsure, say so clearly.\n\n"
+        f"User message:\n{user_text[:5000]}"
+    )
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=prompt
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=180
+        )
     )
 
-    if not response.text:
-        raise ValueError("Gemini returned an empty response.")
+    answer = (response.text or "").strip()
+    if not answer:
+        raise ValueError(
+            "Gemini returned an empty response. Please try a shorter voice query."
+        )
 
-    return response.text.strip()
+    return answer
 
 
 # ---------- Timbre speech generation ----------
@@ -139,10 +161,14 @@ def generate_speech(text, language):
             "Content-Type": "application/json"
         },
         json=payload,
-        timeout=120
+        timeout=GNANI_TTS_TIMEOUT_SECONDS
     )
 
     response.raise_for_status()
+
+    if not response.content:
+        raise ValueError("Timbre returned an empty audio response.")
+
     return response.content
 
 
@@ -185,16 +211,24 @@ else:
     )
 
 if st.button("Process my voice", type="primary", use_container_width=True):
-
     if audio_file is None:
         st.warning("Please record or upload audio first.")
     else:
+        timings = {}
+
         try:
-            with st.spinner("Bharat Voice AI is listening..."):
+            # Stage 1: Speech recognition
+            stt_start = time.perf_counter()
+            with st.status("1/3 — Bharat Voice AI is listening...", expanded=True) as stt_status:
                 audio_bytes = audio_file.getvalue()
                 transcript, detected = transcribe_audio(
                     audio_bytes,
                     audio_file.name or "recording.wav"
+                )
+                timings["Speech recognition"] = time.perf_counter() - stt_start
+                stt_status.update(
+                    label="1/3 — Speech recognized",
+                    state="complete"
                 )
 
             if not transcript.strip():
@@ -205,20 +239,44 @@ if st.button("Process my voice", type="primary", use_container_width=True):
             st.write(transcript)
             st.caption(f"Detected language: {detected}")
 
-            with st.spinner("Thinking..."):
-                answer = generate_answer(transcript)
+            # Stage 2: Gemini response
+            gemini_start = time.perf_counter()
+            with st.status("2/3 — Gemini is preparing your answer...", expanded=True) as gemini_status:
+                try:
+                    answer = generate_answer(transcript)
+                    timings["AI response"] = time.perf_counter() - gemini_start
+                    gemini_status.update(
+                        label="2/3 — AI response ready",
+                        state="complete"
+                    )
+                except Exception:
+                    gemini_status.update(
+                        label="2/3 — AI response failed or timed out",
+                        state="error"
+                    )
+                    raise
 
             st.subheader("Bharat Voice AI says")
             st.write(answer)
 
-            tts_language = choose_tts_language(
-                transcript, detected
-            )
+            # Stage 3: Timbre voice generation
+            tts_language = choose_tts_language(transcript, detected)
+            tts_start = time.perf_counter()
 
-            with st.spinner("Generating your voice response..."):
-                audio_output = generate_speech(
-                    answer, tts_language
-                )
+            with st.status("3/3 — Generating your voice response...", expanded=True) as tts_status:
+                try:
+                    audio_output = generate_speech(answer, tts_language)
+                    timings["Voice generation"] = time.perf_counter() - tts_start
+                    tts_status.update(
+                        label="3/3 — Voice response ready",
+                        state="complete"
+                    )
+                except Exception:
+                    tts_status.update(
+                        label="3/3 — Voice generation failed or timed out",
+                        state="error"
+                    )
+                    raise
 
             st.subheader("Listen to the response")
             st.audio(audio_output, format="audio/wav")
@@ -230,13 +288,46 @@ if st.button("Process my voice", type="primary", use_container_width=True):
 
             st.success("Conversation completed successfully!")
 
+            st.subheader("Performance")
+            total_time = sum(timings.values())
+            metric_cols = st.columns(3)
+            metric_cols[0].metric(
+                "Speech recognition",
+                f"{timings['Speech recognition']:.1f}s"
+            )
+            metric_cols[1].metric(
+                "AI response",
+                f"{timings['AI response']:.1f}s"
+            )
+            metric_cols[2].metric(
+                "Voice generation",
+                f"{timings['Voice generation']:.1f}s"
+            )
+            st.caption(f"Total processing time: {total_time:.1f} seconds")
+
+        except requests.exceptions.Timeout:
+            st.error(
+                "A Gnani service took too long to respond. "
+                "Please try once more with a shorter audio clip."
+            )
+
         except requests.exceptions.HTTPError as error:
             st.error(f"Gnani API error: {error}")
             if error.response is not None:
                 st.code(error.response.text[:1500])
 
         except Exception as error:
-            st.error(f"Something went wrong: {error}")
+            error_text = str(error)
+            if "timeout" in error_text.lower() or "deadline" in error_text.lower():
+                st.error(
+                    "Gemini took too long to respond. Please try again "
+                    "with a shorter voice query."
+                )
+            else:
+                st.error(f"Something went wrong: {error}")
+
+
+# ---------- Conversation history ----------
 
 if st.session_state.history:
     st.divider()
